@@ -1,5 +1,6 @@
 package com.autoguard.companion.ui.screens
 
+import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -18,17 +19,51 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import com.autoguard.companion.ui.theme.PrimaryBlue
 import com.autoguard.companion.ui.viewmodel.MainViewModel
+import com.google.accompanist.permissions.*
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.*
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
 @Composable
 fun FindBikeScreen(viewModel: MainViewModel, navController: NavController) {
     val profile by viewModel.profile.collectAsState()
     val latestLocation by viewModel.latestLocation.collectAsState()
     val context = LocalContext.current
     
+    // SMS Permissions state
+    val smsPermissionsState = rememberMultiplePermissionsState(
+        listOf(
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS
+        )
+    )
+    
     var isRequestSent by remember { mutableStateOf(false) }
+    var requestTime by remember { mutableLongStateOf(0L) }
+    var showTimeoutError by remember { mutableStateOf(false) }
+
+    // Logic to clear "Waiting" state when a new location arrives OR timeout occurs
+    LaunchedEffect(latestLocation) {
+        latestLocation?.let {
+            if (it.timestamp > requestTime) {
+                isRequestSent = false
+                showTimeoutError = false
+            }
+        }
+    }
+
+    LaunchedEffect(isRequestSent) {
+        if (isRequestSent) {
+            showTimeoutError = false
+            delay(60000) // 60 seconds timeout
+            if (isRequestSent) {
+                isRequestSent = false
+                showTimeoutError = true
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -55,7 +90,7 @@ fun FindBikeScreen(viewModel: MainViewModel, navController: NavController) {
             if (bikeGsm.isNullOrBlank()) {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                     Text(
-                        "Please set the Bike GSM Number in your Rider Profile first.",
+                        "Please save the ESP32 GSM SIM number in Rider Profile.",
                         modifier = Modifier.padding(16.dp),
                         color = MaterialTheme.colorScheme.onErrorContainer
                     )
@@ -71,23 +106,64 @@ fun FindBikeScreen(viewModel: MainViewModel, navController: NavController) {
                 )
                 Spacer(modifier = Modifier.height(24.dp))
                 
+                if (!smsPermissionsState.allPermissionsGranted) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text("SMS permission is required to receive bike location.")
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(onClick = { smsPermissionsState.launchMultiplePermissionRequest() }) {
+                                Text("Grant Permissions")
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+
                 Button(
                     onClick = {
-                        viewModel.sendLocationRequest()
-                        isRequestSent = true
-                        Toast.makeText(context, "Location request sent to $bikeGsm", Toast.LENGTH_SHORT).show()
+                        if (smsPermissionsState.allPermissionsGranted) {
+                            viewModel.sendLocationRequest()
+                            isRequestSent = true
+                            requestTime = System.currentTimeMillis()
+                            showTimeoutError = false
+                            Toast.makeText(context, "Location request sent to $bikeGsm", Toast.LENGTH_SHORT).show()
+                        } else {
+                            smsPermissionsState.launchMultiplePermissionRequest()
+                        }
                     },
-                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    enabled = !isRequestSent
                 ) {
                     Icon(Icons.Default.Send, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Send 'LOC' Request SMS")
+                    Text(if (isRequestSent) "Requesting..." else "Send LOC Request")
                 }
                 
                 if (isRequestSent) {
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("Waiting for SMS response...", color = Color.Gray)
+                    Text("Waiting for bike location...", color = Color.Gray)
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+                }
+
+                if (showTimeoutError) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Bike location response not received.", color = MaterialTheme.colorScheme.error)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = { 
+                        if (smsPermissionsState.allPermissionsGranted) {
+                            viewModel.sendLocationRequest()
+                            isRequestSent = true
+                            requestTime = System.currentTimeMillis()
+                            showTimeoutError = false
+                        } else {
+                            smsPermissionsState.launchMultiplePermissionRequest()
+                        }
+                    }) {
+                        Text("Try Again")
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(32.dp))
@@ -96,29 +172,28 @@ fun FindBikeScreen(viewModel: MainViewModel, navController: NavController) {
 
                 if (latestLocation != null) {
                     val loc = latestLocation!!
-                    Text("Latest Known Location", style = MaterialTheme.typography.titleLarge)
+                    Text("Bike Location Found", style = MaterialTheme.typography.titleLarge)
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     val dateStr = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date(loc.timestamp))
-                    Text("Received at: $dateStr")
-                    Text("Lat: ${loc.latitude}")
-                    Text("Lon: ${loc.longitude}")
+                    Text("Timestamp: $dateStr")
+                    Text("Latitude: ${loc.latitude}")
+                    Text("Longitude: ${loc.longitude}")
 
                     Spacer(modifier = Modifier.height(16.dp))
                     
                     if (loc.latitude != null && loc.longitude != null) {
                         Button(
                             onClick = {
-                                val uri = "geo:${loc.latitude},${loc.longitude}?q=${loc.latitude},${loc.longitude}(Bike+Location)"
+                                val uri = "https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
                                 val mapIntent = Intent(Intent.ACTION_VIEW, Uri.parse(uri))
-                                mapIntent.setPackage("com.google.android.apps.maps")
                                 context.startActivity(mapIntent)
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Icon(Icons.Default.LocationOn, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
-                            Text("Open in Google Maps")
+                            Text("View on Map")
                         }
                     }
                 } else {

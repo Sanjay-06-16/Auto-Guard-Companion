@@ -4,7 +4,7 @@ import android.util.Log
 
 data class ParsedSms(
     val type: String, // "ACCIDENT" or "LOCATION"
-    val severity: String, // "MODERATE", "SEVERE", "MINOR", or "N/A"
+    val severity: String, // "MODERATE", "SEVERE", "MINOR", "LOCATION", or "N/A"
     val speed: Int?,
     val lat: Double?,
     val lon: Double?
@@ -12,47 +12,68 @@ data class ParsedSms(
 
 object SmsParser {
     
-    // Formats:
-    // 1. “MODERATE ACCIDENT | Speed: 54 | Lat: 13.0827 | Lon: 80.2707”
-    // 2. “SEVERE ACCIDENT | Speed: 92 | Location: 13.0827,80.2707”
-    // 3. “Bike Location | Lat: 13.0827 | Lon: 80.2707”
-    
+    private const val TAG = "AutoGuardSms"
+
+    /**
+     * Robustly parses incoming SMS messages from the ESP32.
+     * Supported formats:
+     * 1. “MODERATE ACCIDENT | Speed: 54 | Lat: 13.0827 | Lon: 80.2707”
+     * 2. “Bike Location | Lat: 9.947192 | Lon: 78.818826”
+     */
     fun parseMessage(message: String): ParsedSms? {
         val upperMsg = message.uppercase()
         
-        val type = if (upperMsg.contains("ACCIDENT")) "ACCIDENT" else if (upperMsg.contains("BIKE LOCATION")) "LOCATION" else return null
+        val type = when {
+            upperMsg.contains("ACCIDENT") -> "ACCIDENT"
+            upperMsg.contains("BIKE LOCATION") -> "LOCATION"
+            else -> {
+                Log.d(TAG, "Message type unknown or irrelevant: $message")
+                return null
+            }
+        }
         
         var severity = "N/A"
         if (type == "ACCIDENT") {
-            if (upperMsg.contains("SEVERE")) severity = "SEVERE"
-            else if (upperMsg.contains("MODERATE")) severity = "MODERATE"
-            else if (upperMsg.contains("MINOR")) severity = "MINOR"
-        }
-        
-        var speed: Int? = null
-        val speedRegex = Regex("SPEED:\\s*(\\d+)", RegexOption.IGNORE_CASE)
-        val speedMatch = speedRegex.find(message)
-        if (speedMatch != null) {
-            speed = speedMatch.groupValues[1].toIntOrNull()
-        }
-        
-        var lat: Double? = null
-        var lon: Double? = null
-        
-        // Try format with separate Lat and Lon: Lat: 13.0827 | Lon: 80.2707
-        val latLonRegex = Regex("LAT:\\s*([0-9.-]+).*LON:\\s*([0-9.-]+)", RegexOption.IGNORE_CASE)
-        val latLonMatch = latLonRegex.find(message)
-        if (latLonMatch != null) {
-            lat = latLonMatch.groupValues[1].toDoubleOrNull()
-            lon = latLonMatch.groupValues[2].toDoubleOrNull()
-        } else {
-            // Try combined location format: Location: 13.0827,80.2707
-            val locRegex = Regex("LOCATION:\\s*([0-9.-]+)\\s*,\\s*([0-9.-]+)", RegexOption.IGNORE_CASE)
-            val locMatch = locRegex.find(message)
-            if (locMatch != null) {
-                lat = locMatch.groupValues[1].toDoubleOrNull()
-                lon = locMatch.groupValues[2].toDoubleOrNull()
+            severity = when {
+                upperMsg.contains("SEVERE") -> "SEVERE"
+                upperMsg.contains("MODERATE") -> "MODERATE"
+                upperMsg.contains("MINOR") -> "MINOR"
+                else -> "UNKNOWN"
             }
+        } else if (type == "LOCATION") {
+            severity = "LOCATION"
+        }
+        
+        val speedRegex = Regex("SPEED\\s*:\\s*(\\d+)", RegexOption.IGNORE_CASE)
+        val speed = speedRegex.find(message)?.groupValues?.get(1)?.toIntOrNull()
+        
+        // Robust extraction using independent regex for Lat and Lon with flexible spacing
+        val latRegex = Regex("LAT\\s*:\\s*([0-9.-]+)", RegexOption.IGNORE_CASE)
+        val lonRegex = Regex("LON\\s*:\\s*([0-9.-]+)", RegexOption.IGNORE_CASE)
+        
+        val latMatch = latRegex.find(message)
+        val lonMatch = lonRegex.find(message)
+        
+        val (lat, lon) = if (latMatch != null && lonMatch != null) {
+            latMatch.groupValues[1].toDoubleOrNull() to lonMatch.groupValues[1].toDoubleOrNull()
+        } else {
+            // Fallback for combined format: Location: 13.0827,80.2707
+            val locRegex = Regex("LOCATION\\s*:\\s*([0-9.-]+)\\s*[,|]\\s*([0-9.-]+)", RegexOption.IGNORE_CASE)
+            locRegex.find(message)?.let {
+                it.groupValues[1].toDoubleOrNull() to it.groupValues[2].toDoubleOrNull()
+            } ?: (null to null)
+        }
+
+        // Coordinate Validation
+        if (lat != null && lon != null) {
+            if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+                Log.e(TAG, "Invalid coordinates parsed: Lat $lat, Lon $lon")
+                return null
+            }
+            // Logs for latitude and longitude will be handled in SmsReceiver to match user request list
+        } else if (type == "LOCATION") {
+            Log.e(TAG, "Failed to parse coordinates for LOCATION message: $message")
+            return null
         }
         
         return ParsedSms(type, severity, speed, lat, lon)
